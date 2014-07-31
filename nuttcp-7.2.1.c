@@ -1145,7 +1145,7 @@ Usage (transmitter): nuttcp [-t] [-options] [ctl_addr/]host [3rd-party] [<in]\n\
 	-F	flip option to reverse direction of data connection open\n\
 	-a	retry failed server connection \"again\" for transient errors\n"
 #ifdef HAVE_RDMA
-"       -ee     enable RDMA\n\
+"        -ee     enable RDMA\n\
         -ep     set RDMA tcp control port\n"
 #endif
 #ifdef HAVE_SETPRIO
@@ -2393,7 +2393,7 @@ main( int argc, char **argv )
 		case 'a':
 			retry_server = 1;
 			break;
-#ifdef WITH_RDMA
+#ifdef HAVE_RDMA
                 case 'e':
                         reqval = 1;
                         if (argv[0][2] == 'p')
@@ -4814,7 +4814,7 @@ doit:
 		    err("unsupported AF");
 		}
 
-#ifdef WITH_RDMA
+#ifdef HAVE_RDMA
                 // rdma bind control socket on server before signal to client
                 if (clientserver && rdma && !client && (stream_idx == 1))
                 {
@@ -4865,7 +4865,7 @@ doit:
 				usleep(50000);
 		}
 
-#ifdef WITH_RDMA
+#ifdef HAVE_RDMA
                 // rdma channel setup
                 if (clientserver && rdma && (stream_idx == 1))
                 {
@@ -4874,6 +4874,7 @@ doit:
                         fprintf(stderr,"Client RDMA setup\n");
 
                         struct rdma_cm_event *event;
+                        struct rdma_conn_param conn_param;
 
                         struct ibv_qp_init_attr attr = {
                             .cap = {
@@ -4984,7 +4985,7 @@ doit:
                             goto cleanup;
                         }
 
-                        if (rdma_get_cm_event(evch, &event)
+                        if (rdma_get_cm_event(rdma_evch, &event)
                             || event->event != RDMA_CM_EVENT_ESTABLISHED)
                         {
                             fputs("KO\n", stdout);
@@ -5055,7 +5056,7 @@ doit:
 
                         attr.send_cq = attr.recv_cq = rdma_cq;
 
-                        if (rdma_create_qp(client_id, pd, &attr))
+                        if (rdma_create_qp(rdma_client_id, rdma_pd, &attr))
                         {
                             fputs("KO\n", stdout);
                             mes("Error: creating qp event");
