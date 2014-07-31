@@ -4852,7 +4852,7 @@ doit:
                         goto cleanup;
                     }
 
-                    fprintf(stderr,"Socket Bound\n");
+                    //fprintf(stderr,"Socket Bound\n");
                 }
 #endif
 
@@ -4871,7 +4871,7 @@ doit:
                 {
                     if(client)
                     {
-                        fprintf(stderr,"Client RDMA setup\n");
+                        //fprintf(stderr,"Client RDMA setup\n");
 
                         struct rdma_cm_event *event;
                         struct rdma_conn_param conn_param;
@@ -4999,7 +4999,7 @@ doit:
                     }
                     else
                     {
-                        fprintf(stderr,"Server RDMA setup\n");
+                        //fprintf(stderr,"Server RDMA setup\n");
 
                         struct rdma_cm_event *event;
                         struct rdma_conn_param conn_param;
@@ -5087,7 +5087,7 @@ doit:
                             goto cleanup;
                         }
                     }
-                    fprintf(stderr,"RDMA setup complete\n");
+                    //fprintf(stderr,"RDMA setup complete\n");
                 }
 #endif
 
