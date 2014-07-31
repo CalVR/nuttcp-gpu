@@ -489,6 +489,9 @@ static char RCSid[] = "@(#)$Revision: 1.2 $ (BRL)";
 #endif
 */
 
+// TODO: move to cmake build
+#define HAVE_RDMA 1
+
 #ifndef WANT_WUR
 #undef _FORTIFY_SOURCE
 #else
@@ -537,6 +540,10 @@ static char RCSid[] = "@(#)$Revision: 1.2 $ (BRL)";
 #include <unistd.h>
 #include <sys/wait.h>
 #include <strings.h>
+#endif
+
+#ifdef HAVE_RDMA
+#include <rdma/rdma_cma.h>
 #endif
 
 #ifndef ULLONG_MAX
@@ -842,7 +849,7 @@ void print_tcpinfo();
 #endif
 
 int vers_major = 7;
-int vers_minor = 2;
+int vers_minor = 3;
 int vers_delta = 1;
 int ivers;
 int rvers_major = 0;
@@ -1137,6 +1144,10 @@ Usage (transmitter): nuttcp [-t] [-options] [ctl_addr/]host [3rd-party] [<in]\n\
 	-Ixxx	identifier for nuttcp output (max of 40 characters)\n\
 	-F	flip option to reverse direction of data connection open\n\
 	-a	retry failed server connection \"again\" for transient errors\n"
+#ifdef HAVE_RDMA
+"       -ee     enable RDMA\n\
+        -ep     set RDMA tcp control port\n"
+#endif
 #ifdef HAVE_SETPRIO
 "	-xP##	set nuttcp process priority (must be root)\n"
 #endif
@@ -1272,6 +1283,14 @@ unsigned long long nowdi;	/* number of OWD interval measurements */
 double owd_mini;		/* OWD minimum for interval report */
 double owd_maxi;		/* OWD maximum for interval report */
 double owd_avgi;		/* OWD average for interval report */
+
+#ifdef HAVE_RDMA
+struct rdma_event_channel *rdma_evch;
+struct rdma_cm_id *rdma_server_id;
+struct rdma_cm_id *rdma_client_id;
+struct ibv_pd *rdma_pd;
+struct ibv_cq *rdma_cq;
+#endif
 
 void
 close_data_channels()
@@ -1761,6 +1780,10 @@ main( int argc, char **argv )
 	rcvwin = 0;
 	srvrwin = -1;
 	format |= WANTRTT;
+
+        int rdma = 0;
+        int rrdma = 0;
+        int rdma_port = 21234;
 
 	if (argc < 2) goto usage;
 
@@ -2370,6 +2393,25 @@ main( int argc, char **argv )
 		case 'a':
 			retry_server = 1;
 			break;
+#ifdef WITH_RDMA
+                case 'e':
+                        reqval = 1;
+                        if (argv[0][2] == 'p')
+                        {
+                            tmpport = atoi(getoptvalp(argv, 3, reqval, &skiparg));
+                            if ((tmpport < 1024) || (tmpport > 65535)) {
+                                fprintf(stderr, "invalid rdma port = %d\n", tmpport);
+                                fflush(stderr);
+                                exit(1);
+                            }
+                            rdma_port = tmpport;
+                        }
+                        else if(argv[0][2] == 'e')
+                        {
+                            rdma = 1;
+                        }
+                        break;
+#endif
 		case '-':
 			if (strcmp(&argv[0][2], "nofork") == 0) {
 				nofork=1;
@@ -2509,6 +2551,8 @@ main( int argc, char **argv )
 		}
 	}
 
+        fprintf(stderr,"Host3:%d\n",host3);
+
 	if (multicast) {
 		udp = 1;
 		if (!buflenopt) buflen = DEFAULT_MC_UDPBUFLEN;
@@ -2534,6 +2578,15 @@ main( int argc, char **argv )
 	if (!inet_pton(AF_INET6, HI_MC6_ASM, &hi_mc6_asm)) {
 		err("inet_pton");
 	}
+#endif
+
+#ifndef HAVE_RDMA
+        if(rdma)
+        {
+            fprintf(stderr, "Error: not built with RDMA support\n");
+            fflush(stderr);
+            exit(1);
+        }
 #endif
 
 	if (udp && !haverateopt)
@@ -3290,6 +3343,8 @@ doit:
 		nretrans[stream_idx] = 0;
 	}
 
+        fprintf(stderr,"start_idx: %d, nstream: %d\n",start_idx,nstream);
+        fprintf(stderr,"clientserver: %d, client: %d, trans: %d, reverse: %d\n",clientserver,client,trans,reverse);
 	for ( stream_idx = start_idx; stream_idx <= nstream; stream_idx++ ) {
 		if (clientserver && (stream_idx == 1)) {
 			retransinfo = 0;
@@ -3783,6 +3838,25 @@ doit:
 						abortconn = 1;
 					}
 				}
+                                if(irvers >= 70301)
+                                {
+                                    fprintf(ctlconn, " , rdma = %d", rdma);
+                                    fprintf(ctlconn, " , rdma_port = %d", rdma_port);
+                                }
+                                else
+                                {
+                                    if(rdma)
+                                    {
+                                        fprintf(stdout, "nuttcp%s%s: RDMA not supported by server version %d.%d.%d, need >= 7.2.1\n",
+                                                        trans?"-t":"-r",
+                                                        ident, rvers_major,
+                                                        rvers_minor,
+                                                        rvers_delta);
+                                        fflush(stdout);
+                                        rdma = 0;
+                                        abortconn = 1;
+                                    }
+                                }
 				fprintf(ctlconn, "\n");
 				fflush(ctlconn);
 				if (abortconn) {
@@ -4095,6 +4169,17 @@ doit:
 				else {
 					mc_addr = NULL;
 				}
+                                if(irvers >= 70301)
+                                {
+                                    sscanf(strstr(buf, ", rdma =") + 9,
+                                        "%d", &rrdma);
+                                    sscanf(strstr(buf, ", rdma_port =") + 14,
+                                        "%d", &rdma_port);
+                                }
+                                else
+                                {
+                                    rrdma = 0;
+                                }
 				trans = !trans;
 				if (inetd && !sinkmode) {
 					fputs("KO\n", stdout);
@@ -4354,6 +4439,14 @@ doit:
 						goto cleanup;
 					}
 				}
+                                if(rdma != rrdma)
+                                {
+                                    fputs("KO\n", stdout);
+                                    mes("client/server rdma states do not match");
+                                    fprintf(stdout, "rdma active local = '%d', remote = '%d'\n",rdma,rrdma);
+                                    fputs("KO\n", stdout);
+                                    goto cleanup;
+                                }
 				/* used to send server "OK" here -
 				 * now delay sending of server OK until
 				 * after successful server bind() -
@@ -4721,6 +4814,48 @@ doit:
 		    err("unsupported AF");
 		}
 
+#ifdef WITH_RDMA
+                // rdma bind control socket on server before signal to client
+                if (clientserver && rdma && !client && (stream_idx == 1))
+                {
+                    fprintf(stderr,"Setting up RDMA server controll socket\n");
+
+                    if (!(rdma_evch = rdma_create_event_channel()))
+                    {
+                        fputs("KO\n", stdout);
+                        mes("Error: unable create rdma event channel");
+                        fputs("Error: unable to create rdma event channel\n", stdout);
+                        fputs("KO\n", stdout);
+                        goto cleanup;
+                    }
+
+                    if (rdma_create_id(rdma_evch, &rdma_server_id, NULL, RDMA_PS_TCP))
+                    {
+                        fputs("KO\n", stdout);
+                        mes("Error: unable create rdma id");
+                        fputs("Error: unable to create rdma id\n", stdout);
+                        fputs("KO\n", stdout);
+                        goto cleanup;
+                    }
+
+                    struct sockaddr_in sin;
+                    sin.sin_family = AF_INET;
+                    sin.sin_port = htons(rdma_port);
+                    sin.sin_addr.s_addr = htonl(INADDR_ANY);
+
+                    if (rdma_bind_addr(rdma_server_id, (struct sockaddr *)&sin)) 
+                    {
+                        fputs("KO\n", stdout);
+                        mes("Error: unable to bind rdma controll address");
+                        fputs("Error: unable to bind rdma controll address\n", stdout);
+                        fputs("KO\n", stdout);
+                        goto cleanup;
+                    }
+
+                    fprintf(stderr,"Socket Bound\n");
+                }
+#endif
+
 		if (clientserver && !client && (stream_idx == 1)) {
 			/* finally OK to send server "OK" message */
 			fprintf(stdout, "OK v%d.%d.%d\n", vers_major,
@@ -4729,6 +4864,231 @@ doit:
 			if ((trans && !reverse) || (!trans && reverse))
 				usleep(50000);
 		}
+
+#ifdef WITH_RDMA
+                // rdma channel setup
+                if (clientserver && rdma && (stream_idx == 1))
+                {
+                    if(client)
+                    {
+                        fprintf(stderr,"Client RDMA setup\n");
+
+                        struct rdma_cm_event *event;
+
+                        struct ibv_qp_init_attr attr = {
+                            .cap = {
+                                .max_send_wr = 32,
+                                .max_recv_wr = 32,
+                                .max_send_sge = 1,
+                                .max_recv_sge = 1,
+                                .max_inline_data = 64
+                            },
+                            .qp_type = IBV_QPT_RC
+                        };
+
+                        if (!(rdma_evch = rdma_create_event_channel()))
+                        {
+                            fputs("KO\n", stdout);
+                            mes("Error: unable create rdma event channel");
+                            fputs("Error: unable to create rdma event channel\n", stdout);
+                            fputs("KO\n", stdout);
+                            goto cleanup;
+                        }
+
+                        if (rdma_create_id(rdma_evch, &rdma_client_id, NULL, RDMA_PS_TCP))
+                        {
+                            fputs("KO\n", stdout);
+                            mes("Error: unable create rdma id");
+                            fputs("Error: unable to create id\n", stdout);
+                            fputs("KO\n", stdout);
+                            goto cleanup;
+                        }
+
+                        if (rdma_resolve_addr(rdma_client_id, NULL, (struct sockaddr *)&client_ipaddr, 2000))
+                        {
+                            fputs("KO\n", stdout);
+                            mes("Error: rdma_resolve_addr");
+                            fputs("Error: rdma_resolve_addr\n", stdout);
+                            fputs("KO\n", stdout);
+                            goto cleanup;
+                        }
+
+                        if (rdma_get_cm_event(rdma_evch, &event)
+                                || event->event != RDMA_CM_EVENT_ADDR_RESOLVED) 
+                        {
+                            fputs("KO\n", stdout);
+                            mes("Error: rdma_get_cm_event");
+                            fputs("Error: rdma_get_cm_event\n", stdout);
+                            fputs("KO\n", stdout);
+                            goto cleanup;
+                        }
+
+                        rdma_ack_cm_event(event);
+
+                        if (rdma_resolve_route(rdma_client_id, 2000))
+                        {
+                            fputs("KO\n", stdout);
+                            mes("Error: rdma_resolve_route");
+                            fputs("Error: rdma_resolve_route\n", stdout);
+                            fputs("KO\n", stdout);
+                            goto cleanup;
+                        }
+
+                        if (rdma_get_cm_event(rdma_evch, &event)
+                                || event->event != RDMA_CM_EVENT_ROUTE_RESOLVED)
+                        {
+                            fputs("KO\n", stdout);
+                            mes("Error: rdma_get_cm_event");
+                            fputs("Error: rdma_get_cm_event\n", stdout);
+                            fputs("KO\n", stdout);
+                            goto cleanup;
+                        }
+
+                        rdma_ack_cm_event(event);
+
+                        if (!(rdma_pd = ibv_alloc_pd(rdma_client_id->verbs)))
+                        {
+                            fputs("KO\n", stdout);
+                            mes("Error: creating rdma pd");
+                            fputs("Error: creating rdma pd\n", stdout);
+                            fputs("KO\n", stdout);
+                            goto cleanup;
+                        }
+
+                        if (!(rdma_cq = ibv_create_cq(rdma_client_id->verbs, 32, 0, 0, 0))) 
+                        {
+                            fputs("KO\n", stdout);
+                            mes("Error: creating rdma cq");
+                            fputs("Error: creating rdma cq\n", stdout);
+                            fputs("KO\n", stdout);
+                            goto cleanup;
+                        }
+
+                        attr.send_cq = attr.recv_cq = rdma_cq;
+                        if (rdma_create_qp(rdma_client_id, rdma_pd, &attr))
+                        {
+                            fputs("KO\n", stdout);
+                            mes("Error: creating rdma qp");
+                            fputs("Error: creating rdma qp\n", stdout);
+                            fputs("KO\n", stdout);
+                            goto cleanup;
+                        }
+
+                        memset(&conn_param, 0, sizeof conn_param);
+                        if (rdma_connect(rdma_client_id, &conn_param))
+                        {
+                            fputs("KO\n", stdout);
+                            mes("Error: rdma_connect");
+                            fputs("Error: rdma_connect\n", stdout);
+                            fputs("KO\n", stdout);
+                            goto cleanup;
+                        }
+
+                        if (rdma_get_cm_event(evch, &event)
+                            || event->event != RDMA_CM_EVENT_ESTABLISHED)
+                        {
+                            fputs("KO\n", stdout);
+                            mes("Error: rdma_get_cm_event");
+                            fputs("Error: rdma_get_cm_event\n", stdout);
+                            fputs("KO\n", stdout);
+                            goto cleanup;
+                        }
+
+                        rdma_ack_cm_event(event);
+                    }
+                    else
+                    {
+                        fprintf(stderr,"Server RDMA setup\n");
+
+                        struct rdma_cm_event *event;
+                        struct rdma_conn_param conn_param;
+
+                        struct ibv_qp_init_attr attr = {
+                            .cap = {
+                                .max_send_wr = 32,
+                                .max_recv_wr = 32,
+                                .max_send_sge = 1,
+                                .max_recv_sge = 1,
+                                .max_inline_data = 64
+                            },
+                            .qp_type = IBV_QPT_RC
+                        };
+
+                        if (rdma_listen(rdma_server_id, 6))
+                        {
+                            fputs("KO\n", stdout);
+                            mes("Error: listening for RDMA control connection");
+                            fputs("Error: listening for RDMA control connection\n", stdout);
+                            fputs("KO\n", stdout);
+                            goto cleanup;
+                        }
+
+                        if (rdma_get_cm_event(rdma_evch, &event)
+                                || event->event != RDMA_CM_EVENT_CONNECT_REQUEST)
+                        {
+                            fputs("KO\n", stdout);
+                            mes("Error: connect request event");
+                            fputs("Error: connect request event\n", stdout);
+                            fputs("KO\n", stdout);
+                            goto cleanup;
+                        }
+
+                        rdma_client_id = (struct rdma_cm_id *)event->id;
+
+                        if (!(rdma_pd = ibv_alloc_pd(rdma_client_id->verbs)))
+                        {
+                            fputs("KO\n", stdout);
+                            mes("Error: creating pd event");
+                            fputs("Error: creating pd\n", stdout);
+                            fputs("KO\n", stdout);
+                            goto cleanup;
+                        }
+
+                        if (!(rdma_cq = ibv_create_cq(rdma_client_id->verbs, 32, 0, 0, 0)))
+                        {
+                            fputs("KO\n", stdout);
+                            mes("Error: creating cq event");
+                            fputs("Error: creating cq\n", stdout);
+                            fputs("KO\n", stdout);
+                            goto cleanup;
+                        }
+
+                        attr.send_cq = attr.recv_cq = rdma_cq;
+
+                        if (rdma_create_qp(client_id, pd, &attr))
+                        {
+                            fputs("KO\n", stdout);
+                            mes("Error: creating qp event");
+                            fputs("Error: creating qp\n", stdout);
+                            fputs("KO\n", stdout);
+                            goto cleanup;
+                        }
+
+                        memset(&conn_param, 0, sizeof conn_param);
+                        if (rdma_accept(rdma_client_id, &conn_param))
+                        {
+                            fputs("KO\n", stdout);
+                            mes("Error: rdma accept");
+                            fputs("Error: rdma accept\n", stdout);
+                            fputs("KO\n", stdout);
+                            goto cleanup;
+                        }
+
+                        rdma_ack_cm_event(event);
+
+                        if (rdma_get_cm_event(rdma_evch, &event)
+                                || event->event != RDMA_CM_EVENT_ESTABLISHED)
+                        {
+                            fputs("KO\n", stdout);
+                            mes("Error: rdma_get_cm_event");
+                            fputs("Error: rdma_get_cm_event\n", stdout);
+                            fputs("KO\n", stdout);
+                            goto cleanup;
+                        }
+                    }
+                    fprintf(stderr,"RDMA setup complete\n");
+                }
+#endif
 
 		if (clientserver && (stream_idx == 1)) {
 			if (!udp && trans) {
