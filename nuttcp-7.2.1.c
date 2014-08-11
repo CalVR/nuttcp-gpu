@@ -543,6 +543,7 @@ static char RCSid[] = "@(#)$Revision: 1.2 $ (BRL)";
 #endif
 
 #ifdef HAVE_RDMA
+#include <rdma/rdma_verbs.h>
 #include <rdma/rdma_cma.h>
 #endif
 
@@ -1290,7 +1291,17 @@ struct rdma_cm_id *rdma_server_id;
 struct rdma_cm_id *rdma_client_id;
 struct ibv_pd *rdma_pd;
 struct ibv_cq *rdma_cq;
+struct ibv_mr rdma_mr_remote;
+#define NUM_RDMA_BUF 3
+struct ibv_mr *rdma_mr[NUM_RDMA_BUF];
+struct ibv_recv_wr rdma_recv_wr[NUM_RDMA_BUF];
+struct ibv_send_wr rdma_send_wr[NUM_RDMA_BUF];
+int rdma_current_buf;
+char * rdma_buf[NUM_RDMA_BUF];
+struct ibv_mr *rdma_msg_mr;
 #endif
+
+int rdma = 0;
 
 void
 close_data_channels()
@@ -1398,6 +1409,8 @@ sigalarm( int signum )
 	short save_events;
 	long flags, saveflags;
 
+        //fprintf(stdout,"ALARM\n");
+
 	if (host3 && clientserver) {
 		if (client)
 			intr = 1;
@@ -1503,13 +1516,26 @@ sigalarm( int signum )
 		if (clientserver) {
 			nrbytes = nbytes;
 			if (udplossinfo) {
-				ntbytes = *(int64_t *)(buf + 24);
-				if (need_swap) {
-					cp1 = (char *)&ntbytes;
-					cp2 = buf + 31;
-					for ( i = 0; i < 8; i++ )
-						*cp1++ = *cp2--;
-				}
+                                if(!rdma)
+                                {
+                                    ntbytes = *(int64_t *)(buf + 24);
+                                    if (need_swap) {
+                                        cp1 = (char *)&ntbytes;
+                                        cp2 = buf + 31;
+                                        for ( i = 0; i < 8; i++ )
+                                            *cp1++ = *cp2--;
+                                    }
+                                }
+                                else
+                                {
+                                    ntbytes = *(int64_t *)(rdma_buf[rdma_current_buf] + 24);
+                                    if (need_swap) {
+                                        cp1 = (char *)&ntbytes;
+                                        cp2 = rdma_buf[rdma_current_buf] + 31;
+                                        for ( i = 0; i < 8; i++ )
+                                            *cp1++ = *cp2--;
+                                    }
+                                }
 				if (ntbytes > ntbytesc)
 					/* received bytes not counted yet */
 					nrbytes += buflen;
@@ -1518,7 +1544,7 @@ sigalarm( int signum )
 					/* yes they were counted */
 					nrbytes -= buflen;
 			}
-			if (read_retrans) {
+			if (read_retrans && !rdma) {
 				nretrans[1] = *(uint32_t *)(buf + 24);
 				if (need_swap) {
 					cp1 = (char *)&nretrans[1];
@@ -1527,6 +1553,16 @@ sigalarm( int signum )
 						*cp1++ = *cp2--;
 				}
 			}
+                        else if(read_retrans)
+                        {
+                            nretrans[1] = *(uint32_t *)(rdma_buf[rdma_current_buf] + 24);
+                            if (need_swap) {
+                                cp1 = (char *)&nretrans[1];
+                                cp2 = rdma_buf[rdma_current_buf] + 27;
+                                for ( i = 0; i < 4; i++ )
+                                    *cp1++ = *cp2--;
+                            }
+                        }
 			if (*ident)
 				fprintf(stdout, "%s: ", ident + 1);
 			if (format & PARSE)
@@ -1781,7 +1817,6 @@ main( int argc, char **argv )
 	srvrwin = -1;
 	format |= WANTRTT;
 
-        int rdma = 0;
         int rrdma = 0;
         int rdma_port = 21234;
 
@@ -3343,8 +3378,8 @@ doit:
 		nretrans[stream_idx] = 0;
 	}
 
-        fprintf(stderr,"start_idx: %d, nstream: %d\n",start_idx,nstream);
-        fprintf(stderr,"clientserver: %d, client: %d, trans: %d, reverse: %d\n",clientserver,client,trans,reverse);
+        fprintf(stderr,"start_idx: %d, nstream: %d, nbuf: %d\n",start_idx,nstream,nbuf);
+        fprintf(stderr,"clientserver: %d, client: %d, trans: %d, reverse: %d, sinkmode: %d\n",clientserver,client,trans,reverse,sinkmode);
 	for ( stream_idx = start_idx; stream_idx <= nstream; stream_idx++ ) {
 		if (clientserver && (stream_idx == 1)) {
 			retransinfo = 0;
@@ -4175,6 +4210,7 @@ doit:
                                         "%d", &rrdma);
                                     sscanf(strstr(buf, ", rdma_port =") + 14,
                                         "%d", &rdma_port);
+
                                 }
                                 else
                                 {
@@ -4818,7 +4854,7 @@ doit:
                 // rdma bind control socket on server before signal to client
                 if (clientserver && rdma && !client && (stream_idx == 1))
                 {
-                    fprintf(stderr,"Setting up RDMA server controll socket\n");
+                    //fprintf(stderr,"Setting up RDMA server controll socket\n");
 
                     if (!(rdma_evch = rdma_create_event_channel()))
                     {
@@ -4869,6 +4905,19 @@ doit:
                 // rdma channel setup
                 if (clientserver && rdma && (stream_idx == 1))
                 {
+
+                    //rdma_buf = malloc(sizeof(unsigned int));
+                    int i;
+                    for(i = 0; i < NUM_RDMA_BUF; ++i)
+                    {
+                        rdma_buf[i] = malloc(buflen);
+                        pattern(rdma_buf[i],buflen);
+                    }
+                    rdma_current_buf = 0;
+
+                    // creating socket to share memory region, since trying to use
+                    // nuttcp comunication breaks stuff for some reason
+                    //int comsock;
                     if(client)
                     {
                         //fprintf(stderr,"Client RDMA setup\n");
@@ -4905,7 +4954,12 @@ doit:
                             goto cleanup;
                         }
 
-                        if (rdma_resolve_addr(rdma_client_id, NULL, (struct sockaddr *)&client_ipaddr, 2000))
+                        struct sockaddr_in sin;
+                        sin.sin_family = AF_INET;
+                        sin.sin_port = htons(rdma_port);
+                        sin.sin_addr.s_addr = inet_addr(argv[0]);
+
+                        if (rdma_resolve_addr(rdma_client_id, NULL, (struct sockaddr *)&sin, 2000))
                         {
                             fputs("KO\n", stdout);
                             mes("Error: rdma_resolve_addr");
@@ -4919,7 +4973,7 @@ doit:
                         {
                             fputs("KO\n", stdout);
                             mes("Error: rdma_get_cm_event");
-                            fputs("Error: rdma_get_cm_event\n", stdout);
+                            fputs("Error: rdma_get_cm_event address resolved\n", stdout);
                             fputs("KO\n", stdout);
                             goto cleanup;
                         }
@@ -4940,7 +4994,7 @@ doit:
                         {
                             fputs("KO\n", stdout);
                             mes("Error: rdma_get_cm_event");
-                            fputs("Error: rdma_get_cm_event\n", stdout);
+                            fputs("Error: rdma_get_cm_event route resolved\n", stdout);
                             fputs("KO\n", stdout);
                             goto cleanup;
                         }
@@ -4975,6 +5029,76 @@ doit:
                             goto cleanup;
                         }
 
+                        for(i = 0; i < NUM_RDMA_BUF; ++i)
+                        {
+                            if(!(rdma_mr[i] = ibv_reg_mr(rdma_pd, rdma_buf[i], buflen,
+                                            IBV_ACCESS_REMOTE_WRITE |
+                                            IBV_ACCESS_LOCAL_WRITE |
+                                            IBV_ACCESS_REMOTE_READ)))
+                            {
+                                fputs("KO\n", stdout);
+                                mes("Error: register buffer client");
+                                fputs("Error: register buffer client\n", stdout);
+                                fputs("KO\n", stdout);
+                                goto cleanup;
+                            }
+                        }
+
+                        // register memory buffer
+                        //if(!(rdma_mr = rdma_reg_msgs(rdma_client_id,buf,buflen)))
+                        /*if(!(rdma_mr = ibv_reg_mr(rdma_pd, buf, buflen,
+                          IBV_ACCESS_REMOTE_WRITE |
+                          IBV_ACCESS_LOCAL_WRITE |
+                          IBV_ACCESS_REMOTE_READ)))
+                          {
+                          fputs("KO\n", stdout);
+                          mes("Error: register buffer client");
+                          fputs("Error: register buffer client\n", stdout);
+                          fputs("KO\n", stdout);
+                          goto cleanup;
+                          }
+
+                          if(!(rdma_msg_mr = ibv_reg_mr(rdma_pd, rdma_buf, sizeof(unsigned int),
+                          IBV_ACCESS_REMOTE_WRITE |
+                          IBV_ACCESS_LOCAL_WRITE |
+                          IBV_ACCESS_REMOTE_READ)))
+                          {
+                          fputs("KO\n", stdout);
+                          mes("Error: register msg buffer client");
+                          fputs("Error: register msg buffer client\n", stdout);
+                          fputs("KO\n", stdout);
+                          goto cleanup;
+                          }*/
+
+                        struct ibv_sge * sge;
+
+                        if(!trans)
+                        {
+                            for(i = 0; i < NUM_RDMA_BUF; ++i)
+                            {
+                                bzero(rdma_buf[i] + 24, 8);
+                                sge = malloc(sizeof(struct ibv_sge));
+                                sge->addr = (uint64_t)rdma_buf[i];
+                                sge->length = buflen;
+                                sge->lkey = rdma_mr[i]->lkey;
+                                rdma_recv_wr[i].sg_list = sge;
+                                rdma_recv_wr[i].num_sge = 1;
+                                rdma_recv_wr[i].next = NULL;
+                            }
+
+                            for(i = 1; i < NUM_RDMA_BUF; ++i)
+                            {
+                                if(ibv_post_recv(rdma_client_id->qp, &rdma_recv_wr[i], NULL))
+                                {
+                                    fputs("KO\n", stdout);
+                                    mes("Error: rdma post recv");
+                                    fputs("Error: rdma post recv\n", stdout);
+                                    fputs("KO\n", stdout);
+                                    goto cleanup;
+                                }
+                            }
+                        }
+
                         memset(&conn_param, 0, sizeof conn_param);
                         if (rdma_connect(rdma_client_id, &conn_param))
                         {
@@ -4986,16 +5110,188 @@ doit:
                         }
 
                         if (rdma_get_cm_event(rdma_evch, &event)
-                            || event->event != RDMA_CM_EVENT_ESTABLISHED)
+                                || event->event != RDMA_CM_EVENT_ESTABLISHED)
                         {
                             fputs("KO\n", stdout);
                             mes("Error: rdma_get_cm_event");
-                            fputs("Error: rdma_get_cm_event\n", stdout);
+                            fputs("Error: rdma_get_cm_event established client\n", stdout);
                             fputs("KO\n", stdout);
                             goto cleanup;
                         }
 
                         rdma_ack_cm_event(event);
+
+                        if(trans)
+                        {
+                            struct ibv_sge * sge;
+
+                            for(i = 0; i < NUM_RDMA_BUF; ++i)
+                            {
+                                sge = malloc(sizeof(struct ibv_sge));
+                                sge->addr = (uint64_t)rdma_buf[i];
+                                sge->length = buflen;
+                                sge->lkey = rdma_mr[i]->lkey;
+                                rdma_send_wr[i].sg_list = sge;
+                                rdma_send_wr[i].num_sge = 1;
+                                rdma_send_wr[i].opcode = IBV_WR_SEND;
+                                rdma_send_wr[i].send_flags = IBV_SEND_SIGNALED;
+                                rdma_send_wr[i].next = NULL;
+                            }
+                        }
+
+                        /*struct sockaddr_in sinc;
+                          sinc.sin_family = AF_INET;
+                          sinc.sin_port = htons(rdma_port+2);
+                          sinc.sin_addr.s_addr = inet_addr(argv[0]);
+
+                          comsock = socket(AF_INET, SOCK_STREAM, 0);
+                          int yes = 1;
+                          setsockopt(comsock,SOL_SOCKET,SO_REUSEADDR,(const char *)&yes,sizeof(int));
+
+                          if(connect(comsock,(struct sockaddr *)&sinc,sizeof(struct sockaddr)) < 0)
+                          {
+                          fputs("KO\n", stdout);
+                          mes("Error: rdma mr connect");
+                          fputs("Error: rdma mr connect\n", stdout);
+                          fputs("KO\n", stdout);
+                          goto cleanup;
+                          }
+
+                          read(comsock,&rdma_mr_remote,sizeof(struct ibv_mr));
+
+                          close(comsock);
+
+                          sprintf(buf,"Client buffer message\n");
+
+                          if(trans)
+                          {
+
+                          if(rdma_post_write(rdma_client_id,NULL,buf,buflen,rdma_mr,IBV_SEND_SIGNALED,(uint64_t)rdma_mr_remote.addr,rdma_mr_remote.rkey) < 0)
+                          {
+                          fputs("KO\n", stdout);
+                          mes("Error: rdma post write");
+                          fputs("Error: rdma post write\n", stdout);
+                          fputs("KO\n", stdout);
+                          goto cleanup;
+                          }
+                          struct ibv_sge sge;
+
+                          sge.addr = (uint64_t)buf;
+                          sge.length = buflen;
+                          sge.lkey = rdma_mr->lkey;
+                          rdma_send_wr.sg_list = &sge;
+                          rdma_send_wr.num_sge = 1;
+                          rdma_send_wr.opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
+                          rdma_send_wr.send_flags = IBV_SEND_SIGNALED;
+                          rdma_send_wr.next = NULL;
+                          rdma_send_wr.imm_data = htonl(43);
+                          rdma_send_wr.wr.rdma.remote_addr = (uint64_t)rdma_mr_remote.addr;
+                          rdma_send_wr.wr.rdma.rkey = rdma_mr_remote.rkey;
+
+                          if(ibv_post_send(rdma_client_id->qp, &rdma_send_wr, NULL))
+                          {
+                          fputs("KO\n", stdout);
+                          mes("Error: rdma post write");
+                          fputs("Error: rdma post write\n", stdout);
+                          fputs("KO\n", stdout);
+                          goto cleanup;
+                          }
+                          }
+                          else
+                          {
+                          if(rdma_post_read(rdma_client_id,NULL,buf,buflen,rdma_mr,IBV_SEND_SIGNALED,(uint64_t)rdma_mr_remote.addr,rdma_mr_remote.rkey) < 0)
+                          {
+                          fputs("KO\n", stdout);
+                          mes("Error: rdma post write");
+                          fputs("Error: rdma post write\n", stdout);
+                          fputs("KO\n", stdout);
+                          goto cleanup;
+                          }
+                          }*/
+
+                        /*if (!rdma_get_cm_event(rdma_evch, &event))
+                          {
+                          fputs("KO\n", stdout);
+                          mes("Error: rdma_get_cm_event");
+                          fputs("Error: rdma_get_cm_event client test read/write\n", stdout);
+                          fputs(ibv_event_type_str(event->event), stdout);
+                          fputs("\n", stdout);
+                          fputs("KO\n", stdout);
+                          goto cleanup;
+                          }
+                          else
+                          {
+                          fputs("KO\n", stdout);
+                          mes("Error: rdma_get_cm_event");
+                          fputs("Error: rdma_get_cm_event client test read/write\n", stdout);
+                          fputs("Did not get event!\n", stdout);
+                          fputs("KO\n", stdout);
+                          goto cleanup;
+                          }*/
+
+                        /*struct ibv_wc wc;
+
+                          while (!ibv_poll_cq(rdma_cq, 1, &wc));
+                          if(wc.status != IBV_WC_SUCCESS)
+                          {
+                          fputs("KO\n", stdout);
+                          mes("Error: rdma wc");
+                          fputs("Error: rdma wc client test read/write\n", stdout);
+                          fprintf(stdout,"Did not get success. Got: %d\n",wc.status);
+                          fputs("KO\n", stdout);
+                          goto cleanup;
+                          }*/
+
+                        /**((unsigned int *)rdma_buf) = 42;
+
+                          struct ibv_sge sge;
+
+                          sge.addr = (uint64_t)rdma_buf;
+                          sge.length = sizeof(unsigned int);
+                          sge.lkey = rdma_msg_mr->lkey;
+                          rdma_send_wr.sg_list = &sge;
+                          rdma_send_wr.num_sge = 1;
+                          rdma_send_wr.opcode = IBV_WR_SEND;
+                          rdma_send_wr.send_flags = IBV_SEND_SIGNALED;
+                          rdma_send_wr.next = NULL;
+
+                          if (ibv_post_send(rdma_client_id->qp, &rdma_send_wr, NULL))
+                          {
+                          fputs("KO\n", stdout);
+                          mes("Error: rdma post write");
+                          fputs("Error: rdma post write\n", stdout);
+                          fputs("KO\n", stdout);
+                          goto cleanup;
+                          }
+
+                          while (!ibv_poll_cq(rdma_cq, 1, &wc));
+                          if(wc.status != IBV_WC_SUCCESS)
+                          {
+                          fputs("KO\n", stdout);
+                          mes("Error: rdma wc");
+                          fputs("Error: rdma wc client test msg\n", stdout);
+                          fprintf(stdout,"Did not get success. Got: %d\n",wc.status);
+                          fputs("KO\n", stdout);
+                          goto cleanup;
+                          }*/
+
+                        /*char * rdma_line = NULL;
+                          size_t n = 0;
+
+                          getline(&rdma_line,&n,stdin);
+
+                          sscanf(rdma_line, "MR addr: %p, length: %u, lkey: %u, rkey: %u\n", &rdma_mr_remote.addr, &rdma_mr_remote.length, &rdma_mr_remote.lkey, &rdma_mr_remote.rkey);*/
+                        //fread(&rdma_mr_remote,sizeof(struct ibv_mr),1,stdin);
+
+                        /*fputs("KO\n", stdout);
+                        //mes("Error: rdma_get_cm_event");
+                        //fputs("Error: rdma_get_cm_event established client\n", stdout);
+                        //fprintf(stdout,"line: %s",rdma_line);
+                        fprintf(stdout,"Got remote mr, addr: %d, length: %d, lkey: %d, rkey: %d\n",rdma_mr_remote.addr,rdma_mr_remote.length,rdma_mr_remote.lkey,rdma_mr_remote.rkey);
+                        fprintf(stdout,"Client buffer: %s\n",buf);
+                        fputs("KO\n", stdout);
+                        //free(rdma_line);
+                        goto cleanup;*/
                     }
                     else
                     {
@@ -5065,6 +5361,140 @@ doit:
                             goto cleanup;
                         }
 
+                        /*if(trans)
+                          {
+                          if(!(rdma_mr = rdma_reg_read(rdma_client_id,buf,buflen)))
+                          {
+                          fputs("KO\n", stdout);
+                          mes("Error: register buffer server read");
+                          fputs("Error: register buffer server read\n", stdout);
+                          fputs("KO\n", stdout);
+                          goto cleanup;
+                          }
+                          }
+                          else
+                          {
+                          if(!(rdma_mr = rdma_reg_write(rdma_client_id,buf,buflen)))
+                          {
+                          fputs("KO\n", stdout);
+                          mes("Error: register buffer server write");
+                          fputs("Error: register buffer server write\n", stdout);
+                          fputs("KO\n", stdout);
+                          goto cleanup;
+                          }
+                          }*/
+
+                        for(i = 0; i < NUM_RDMA_BUF; ++i)
+                        {
+                            if(!(rdma_mr[i] = ibv_reg_mr(rdma_pd, rdma_buf[i], buflen,
+                                            IBV_ACCESS_REMOTE_WRITE |
+                                            IBV_ACCESS_LOCAL_WRITE |
+                                            IBV_ACCESS_REMOTE_READ)))
+                            {
+                                fputs("KO\n", stdout);
+                                mes("Error: register buffer server");
+                                fputs("Error: register buffer server\n", stdout);
+                                fputs("KO\n", stdout);
+                                goto cleanup;
+                            }
+                        }
+
+                        /*if(!(rdma_mr = ibv_reg_mr(rdma_pd, buf, buflen,
+                          IBV_ACCESS_REMOTE_WRITE |
+                          IBV_ACCESS_LOCAL_WRITE |
+                          IBV_ACCESS_REMOTE_READ)))
+                          {
+                          fputs("KO\n", stdout);
+                          mes("Error: register buffer server");
+                          fputs("Error: register buffer server\n", stdout);
+                          fputs("KO\n", stdout);
+                          goto cleanup;
+                          }
+
+                          if(!(rdma_msg_mr = ibv_reg_mr(rdma_pd, rdma_buf, sizeof(unsigned int),
+                          IBV_ACCESS_REMOTE_WRITE |
+                          IBV_ACCESS_LOCAL_WRITE |
+                          IBV_ACCESS_REMOTE_READ)))
+                          {
+                          fputs("KO\n", stdout);
+                          mes("Error: register msg buffer server");
+                          fputs("Error: register msg buffer server\n", stdout);
+                          fputs("KO\n", stdout);
+                          goto cleanup;
+                          }*/
+
+                        //fprintf(stdout,"MR addr: %p, length: %u, lkey: %u, rkey: %u\n",rdma_mr->addr,rdma_mr->length,rdma_mr->lkey,rdma_mr->rkey);
+                        //fwrite(rdma_mr,sizeof(struct ibv_mr),1,stdout);
+
+                        //sprintf(buf,"Test Msg in server buffer\n");
+
+                        /*struct sockaddr_in sinc;
+                          sinc.sin_family = AF_INET;
+                          sinc.sin_port = htons(rdma_port+2);
+                          sinc.sin_addr.s_addr = htonl(INADDR_ANY);
+
+                          comsock = socket(AF_INET, SOCK_STREAM, 0);
+                          int yes = 1;
+                          setsockopt(comsock,SOL_SOCKET,SO_REUSEADDR,(const char *)&yes,sizeof(int));
+
+                          if(bind(comsock,(struct sockaddr *)&sinc,sizeof(struct sockaddr)) < 0)
+                          {
+                          fputs("KO\n", stdout);
+                          mes("Error: rdma mr bind");
+                          fputs("Error: rdma mr bind\n", stdout);
+                          fputs("KO\n", stdout);
+                          goto cleanup;
+                          }
+
+                          listen(comsock,5);*/
+
+                        /*struct ibv_sge sge;
+
+                          sge.addr = (uint64_t)rdma_buf;
+                          sge.length = sizeof(unsigned int);
+                          sge.lkey = rdma_msg_mr->lkey;
+                          rdma_recv_wr.sg_list = &sge;
+                          rdma_recv_wr.num_sge = 1;
+                          rdma_recv_wr.next = NULL;
+                          if(ibv_post_recv(rdma_client_id->qp, &rdma_recv_wr, NULL))
+                          {
+                          fputs("KO\n", stdout);
+                          mes("Error: rdma post recv");
+                          fputs("Error: rdma post recv\n", stdout);
+                          fputs("KO\n", stdout);
+                          goto cleanup;
+                          }*/
+
+
+                        struct ibv_sge * sge;
+
+                        if(!trans)
+                        {
+                            for(i = 0; i < NUM_RDMA_BUF; ++i)
+                            {
+                                bzero(rdma_buf[i] + 24, 8);
+                                sge = malloc(sizeof(struct ibv_sge));
+                                sge->addr = (uint64_t)rdma_buf[i];
+                                sge->length = buflen;
+                                sge->lkey = rdma_mr[i]->lkey;
+                                rdma_recv_wr[i].sg_list = sge;
+                                rdma_recv_wr[i].num_sge = 1;
+                                rdma_recv_wr[i].next = NULL;
+                            }
+
+                            for(i = 1; i < NUM_RDMA_BUF; ++i)
+                            {
+                                if(ibv_post_recv(rdma_client_id->qp, &rdma_recv_wr[i], NULL))
+                                {
+                                    fputs("KO\n", stdout);
+                                    mes("Error: rdma post recv");
+                                    fputs("Error: rdma post recv\n", stdout);
+                                    fputs("KO\n", stdout);
+                                    goto cleanup;
+                                }
+                            }
+                        }
+
                         memset(&conn_param, 0, sizeof conn_param);
                         if (rdma_accept(rdma_client_id, &conn_param))
                         {
@@ -5082,10 +5512,97 @@ doit:
                         {
                             fputs("KO\n", stdout);
                             mes("Error: rdma_get_cm_event");
-                            fputs("Error: rdma_get_cm_event\n", stdout);
+                            fputs("Error: rdma_get_cm_event established server\n", stdout);
                             fputs("KO\n", stdout);
                             goto cleanup;
                         }
+
+                        rdma_ack_cm_event(event);
+
+                        if(trans)
+                        {
+                            struct ibv_sge * sge;
+
+                            for(i = 0; i < NUM_RDMA_BUF; ++i)
+                            {
+                                sge = malloc(sizeof(struct ibv_sge));
+                                sge->addr = (uint64_t)rdma_buf[i];
+                                sge->length = buflen;
+                                sge->lkey = rdma_mr[i]->lkey;
+                                rdma_send_wr[i].sg_list = sge;
+                                rdma_send_wr[i].num_sge = 1;
+                                rdma_send_wr[i].opcode = IBV_WR_SEND;
+                                rdma_send_wr[i].send_flags = IBV_SEND_SIGNALED;
+                                rdma_send_wr[i].next = NULL;
+                            }
+                        }
+
+                        /*struct sockaddr_in clientsin;
+                          socklen_t cslen = sizeof(clientsin);
+                          int newsock = accept(comsock,(struct sockaddr *)&clientsin,&cslen);
+                          if(newsock < 0)
+                          {
+                          fputs("KO\n", stdout);
+                          mes("Error: rdma mr accept");
+                          fputs("Error: rdma mr accept\n", stdout);
+                          fputs("KO\n", stdout);
+                          goto cleanup;
+                          }
+
+                          close(comsock);
+
+                          write(newsock,rdma_mr,sizeof(struct ibv_mr));
+
+                          close(newsock);*/
+
+                        /*struct ibv_wc wc;
+
+                          while (!ibv_poll_cq(rdma_cq, 1, &wc));
+                          if(wc.status != IBV_WC_SUCCESS)
+                          {
+                          fputs("KO\n", stdout);
+                          mes("Error: rdma wc");
+                          fputs("Error: rdma wc server\n", stdout);
+                          fprintf(stdout,"Did not get success. Got: %d\n",wc.status);
+                          fputs("KO\n", stdout);
+                          goto cleanup;
+                          }*/
+
+                        /*if (!rdma_get_cm_event(rdma_evch, &event))
+                          {
+                          fputs("KO\n", stdout);
+                          mes("Error: rdma_get_cm_event");
+                          fputs("Error: rdma_get_cm_event client test read/write\n", stdout);
+                          fputs(ibv_event_type_str(event->event), stdout);
+                          fputs("\n",stdout);
+                          fputs("KO\n", stdout);
+                          goto cleanup;
+                          }
+                          else
+                          {
+                          fputs("KO\n", stdout);
+                          mes("Error: rdma_get_cm_event");
+                          fputs("Error: rdma_get_cm_event client test read/write\n", stdout);
+                          fputs("Did not get event!\n", stdout);
+                          fputs("KO\n", stdout);
+                          goto cleanup;
+                          }*/
+
+                        // send mr info
+                        //fwrite(rdma_mr,sizeof(struct ibv_mr),1,ctlconn);
+                        //fprintf(stdout,"Sending, addr: %d, length: %d, lkey: %d, rkey: %d\n",rdma_mr->addr,rdma_mr->length,rdma_mr->lkey,rdma_mr->rkey);
+
+                        /*int imm = ntohl(wc.imm_data);
+
+                          fputs("KO\n", stdout);
+                          mes("Error: rdma_get_cm_event");
+                        //fputs("Error: rdma_get_cm_event established client\n", stdout);
+                        fprintf(stdout,"Sending, addr: %d, length: %d, lkey: %d, rkey: %d\n",rdma_mr->addr,rdma_mr->length,rdma_mr->lkey,rdma_mr->rkey);
+                        fprintf(stdout,"Server buffer: %s\n",buf);
+                        fprintf(stdout,"Server imm value: %u\n",imm);
+                        fputs("KO\n", stdout);
+                        goto cleanup;*/
+
                     }
                     //fprintf(stderr,"RDMA setup complete\n");
                 }
@@ -7009,6 +7526,7 @@ acceptnewconn:
 		if (fcntl(0, F_SETFL, flags) < 0)
 			err("fcntl 2");
 	}
+
 	if (sinkmode) {
 		register int cnt = 0;
 		if (trans) {
@@ -7037,14 +7555,35 @@ acceptnewconn:
 					setitimer(ITIMER_REAL, &itimer, 0);
 				prep_timer();
 			}
-			bzero(buf + 8, 8);	/* zero out timestamp */
+                        if(!rdma)
+                        {
+			    bzero(buf + 8, 8);	/* zero out timestamp */
+                        }
+                        else
+                        {
+                            int i;
+                            for(i = 0; i < NUM_RDMA_BUF; ++i)
+                            {
+                                bzero(rdma_buf[i] + 8, 8);
+                            }
+                        }
 			nbytes += buflen;
 			if (do_poll && (format & DEBUGPOLL)) {
 				fprintf(stdout, "do_poll is set\n");
 				fflush(stdout);
 			}
-			if (udplossinfo)
+			if (udplossinfo && !rdma)
+                        {
 				bcopy(&nbytes, buf + 24, 8);
+                        }
+                        else if(udplossinfo && rdma)
+                        {
+                            int i;
+                            for(i = 0; i < NUM_RDMA_BUF; ++i)
+                            {
+                                bcopy(&nbytes, rdma_buf[i] + 24, 8);
+                            }
+                        }
 			if (!udp && interval && !(format & NORETRANS) &&
 			    (nstream == 1) &&
 			    ((retransinfo == 1) ||
@@ -7056,25 +7595,58 @@ acceptnewconn:
 					if (send_retrans)
 						do_retrans = 1;
 					send_retrans = 0;
-					if (!udp)
+					if (!udp && !rdma)
+                                        {
 						bzero(buf + 24, 8);
+                                        }
+                                        else if(!udp && rdma)
+                                        {
+                                            int i;
+                                            for(i = 0; i < NUM_RDMA_BUF; ++i)
+                                            {
+                                                bzero(rdma_buf[i] + 24, 8);
+                                            }
+                                        }
 				}
 				else {
 					if (retransinfo == 1)
 						tmp = 0x5254524Eu;  /* "RTRN" */
 					else
 						tmp = 0x48525452u;  /* "HRTR" */
-					bcopy(&nretrans[1], buf + 24, 4);
-					bcopy(&tmp, buf + 28, 4);
+                                        if(!rdma)
+                                        {
+					    bcopy(&nretrans[1], buf + 24, 4);
+					    bcopy(&tmp, buf + 28, 4);
+                                        }
+                                        else if(rdma)
+                                        {
+                                            int i;
+                                            for(i = 0; i < NUM_RDMA_BUF; ++i)
+                                            {
+                                                bcopy(&nretrans[1], rdma_buf[i] + 24, 4);
+                                                bcopy(&tmp, rdma_buf[i] + 28, 4);
+                                            }
+                                        }
 					do_retrans = 0;
 				}
 			}
 			else {
 				send_retrans = 0;
 				do_retrans = 0;
-				if (!udp)
+				if (!udp && !rdma)
+                                {
 					bzero(buf + 24, 8);
+                                }
+                                else if(!udp && rdma)
+                                {
+                                    int i;
+                                    for(i = 0; i < NUM_RDMA_BUF; ++i)
+                                    {
+                                        bzero(rdma_buf[i] + 24, 8);
+                                    }
+                                }
 			}
+                        //fprintf(stdout,"nbuf: %d \n",nbuf);
 			if (nbuf == INT_MAX)
 				nbuf = ULLONG_MAX;
 			if (!client) {
@@ -7090,8 +7662,68 @@ acceptnewconn:
 				}
 				pollfds[0].events = save_events;
 			}
-			while (nbuf-- && ((cnt = Nwrite(fd[stream_idx + 1], buf, buflen)) == buflen) && !intr) {
+                        int rdma_done_sig = 0;
+			while (1) {
+                                if(!rdma && !(nbuf-- && ((cnt = Nwrite(fd[stream_idx + 1], buf, buflen)) == buflen) && !intr))
+                                {
+                                    break;
+                                }
+                                else if(rdma)
+                                {
+
+                                    //fprintf(stdout,"RDMA loop nbuf: %d, cnt: %d, intr: %d, nbytes: %d\n",nbuf,cnt,intr,nbytes);
+                                    if(!nbuf--)
+                                    {
+                                        break;
+                                    }
+                                    // do send
+                                    int sendIndex = rdma_current_buf;
+                                    rdma_current_buf = (rdma_current_buf + 1) % NUM_RDMA_BUF;
+
+                                    // send trans intr status so recv not stuck waiting
+                                    bcopy(&rdma_done_sig,rdma_buf[sendIndex] + 128,sizeof(int));
+
+                                    //fprintf(stdout,"Sendbuf: %d, currentbuf: %d\n",sendIndex,rdma_current_buf);
+
+                                    // setup send
+                                    if(ibv_post_send(rdma_client_id->qp, &rdma_send_wr[sendIndex], NULL))
+                                    {
+                                        fputs("KO\n", stdout);
+                                        mes("Error: rdma post send");
+                                        fputs("Error: rdma post send\n", stdout);
+                                        fputs("KO\n", stdout);
+                                        goto cleanup;
+                                    }
+
+                                    struct ibv_wc wc;
+
+                                    // wait for finish
+                                    while (!ibv_poll_cq(rdma_cq, 1, &wc));
+                                    if(wc.status != IBV_WC_SUCCESS)
+                                    {
+                                        fputs("KO\n", stdout);
+                                        mes("Error: rdma send wc");
+                                        fputs("Error: rdma send wc\n", stdout);
+                                        fprintf(stdout,"Did not get success. Got: %d\n",wc.status);
+                                        fputs("KO\n", stdout);
+                                        goto cleanup;
+                                    }
+
+                                    if(rdma_done_sig)
+                                    {
+                                        cnt = 0;
+                                        break;
+                                    }
+
+                                    cnt = buflen;
+
+                                    if(intr && !rdma_done_sig)
+                                    {
+                                        rdma_done_sig = 1;
+                                    }
+                                }
 				if (clientserver && ((nbuf & 0x3FF) == 0)) {
+                                    //fprintf(stdout,"In check\n");
 				    if (!client) {
 					/* check if client went away */
 					pollfds[0].fd = fileno(ctlconn);
@@ -7128,15 +7760,40 @@ acceptnewconn:
 					pollfds[0].events = save_events;
 				    }
 				}
+                                else
+                                {
+                                    //fprintf(stdout,"No check\n");
+                                }
 				nbytes += buflen;
 				cnt = 0;
-				if (udplossinfo)
+				if (udplossinfo && !rdma)
+                                {
 					bcopy(&nbytes, buf + 24, 8);
+                                }
+                                else if(udplossinfo && rdma)
+                                {
+                                    int i;
+                                    for(i = 0; i < NUM_RDMA_BUF; ++i)
+                                    {
+                                        bcopy(&nbytes, rdma_buf[i] + 24, 8);
+                                    }
+                                }
 				if (send_retrans) {
 					nretrans[1] = get_retrans(
 							fd[stream_idx + 1]);
 					nretrans[1] -= iretrans[1];
-					bcopy(&nretrans[1], buf + 24, 4);
+                                        if(!rdma)
+                                        {
+					    bcopy(&nretrans[1], buf + 24, 4);
+                                        }
+                                        else
+                                        {
+                                            int i;
+                                            for(i = 0; i < NUM_RDMA_BUF; ++i)
+                                            {
+                                                bcopy(&nretrans[1], rdma_buf[i] + 24, 4);
+                                            }
+                                        }
 				}
 				stream_idx++;
 				stream_idx = stream_idx % nstream;
@@ -7184,11 +7841,13 @@ acceptnewconn:
 #endif
 					while (fgets(intervalbuf, sizeof(intervalbuf), stdin))
 					{
+                                            //fprintf(stdout,"intervalbuf: %s\n",intervalbuf);
 					if (strncmp(intervalbuf, "DONE", 4) == 0) {
 						if (format & DEBUGPOLL) {
 							fprintf(stdout, "got DONE\n");
 							fflush(stdout);
 						}
+                                                fprintf(stdout,"Got done.\n");
 						got_done = 1;
 						intr = 1;
 						do_poll = 0;
@@ -7314,6 +7973,8 @@ acceptnewconn:
 			nbytes -= buflen;
 			if (intr && (cnt > 0))
 				nbytes += cnt;
+
+                        // does not fit rdma stuff, but it is udp anyway
 			if (udp) {
 				if (multicast)
 				    bcopy((char *)&save_sinhim.sin_addr.s_addr,
@@ -7323,6 +7984,7 @@ acceptnewconn:
 				(void)Nwrite( fd[stream_idx + 1], buf, 4 ); /* rcvr end */
 			}
 		} else {
+                    //fprintf(stdout,"nuttcp-r Starting recv\n");
 			first_read = 1;
 			first_jitter = 1;
 			first_jitteri = 1;
@@ -7562,7 +8224,61 @@ acceptnewconn:
 								/ 1000000;
 			    }
 			} else {
-			    while (((cnt=Nread(fd[stream_idx + 1], buf, buflen)) > 0) && !intr) {
+			    while (1) {
+                                //fprintf(stdout,"nuttcp-r: In recv loop cnt: %d, rdma: %d, intr: %d\n",cnt,rdma,intr);
+                                    if(!rdma)
+                                    {
+                                        if(!(((cnt=Nread(fd[stream_idx + 1], buf, buflen)) > 0) && !intr))
+                                        {
+                                            break;
+                                        }
+                                    }
+                                    else
+                                    {
+                                        if(intr)
+                                        {
+                                            break;
+                                        }
+
+                                        struct ibv_wc wc;
+
+                                        // wait for recv
+                                        while (!ibv_poll_cq(rdma_cq, 1, &wc)) ;
+                                        if (wc.status != IBV_WC_SUCCESS) 
+                                        {
+                                            fputs("KO\n", stdout);
+                                            mes("Error: rdma recv wc");
+                                            fputs("Error: rdma recv wc\n", stdout);
+                                            fprintf(stdout,"Did not get success. Got: %d\n",wc.status);
+                                            fputs("KO\n", stdout);
+                                            goto cleanup;
+                                        }
+
+                                        int recvIndex = rdma_current_buf;
+                                        rdma_current_buf = (rdma_current_buf + 1) % NUM_RDMA_BUF;
+
+                                        //fprintf(stdout,"nuttcp-r: recvInd: %d, currentbuf: %d\n",recvIndex,rdma_current_buf);
+
+                                        if (ibv_post_recv(rdma_client_id->qp, &rdma_recv_wr[recvIndex], NULL))
+                                        {
+                                            fputs("KO\n", stdout);
+                                            mes("Error: rdma post recv");
+                                            fputs("Error: rdma post recv\n", stdout);
+                                            fputs("KO\n", stdout);
+                                            goto cleanup;
+                                        }
+
+                                        if(*((int*)(rdma_buf[rdma_current_buf] + 128)))
+                                        {
+                                            //int val = *((int*)(rdma_buf[rdma_current_buf] + 128));
+                                            //fprintf(stdout,"nuttcp-r: got sender done val: %d\n",val);
+                                            // transmitter done
+                                            //nbytes += buflen;
+                                            cnt = 0;
+                                            break;
+                                        }
+                                        cnt = buflen;
+                                    }
 				    nbytes += cnt;
 				    cnt = 0;
 				    if (first_read) {
@@ -7570,8 +8286,16 @@ acceptnewconn:
 					    uint32_t tmp;
 
 					    first_read = 0;
-					    bcopy(buf + 24, &nretrans[1], 4);
-					    bcopy(buf + 28, &tmp, 4);
+                                            if(!rdma)
+                                            {
+					        bcopy(buf + 24, &nretrans[1], 4);
+					        bcopy(buf + 28, &tmp, 4);
+                                            }
+                                            else
+                                            {
+                                                bcopy(rdma_buf[rdma_current_buf] + 24, &nretrans[1], 4);
+                                                bcopy(rdma_buf[rdma_current_buf] + 28, &tmp, 4);
+                                            }
 					    if (tmp == 0x5254524Eu) {
 						    /* "RTRN" */
 						    retransinfo = 1;
@@ -7602,7 +8326,7 @@ acceptnewconn:
 					else
 					    read_retrans = 0;
 				    }
-				    if (read_retrans) {
+				    if (read_retrans && !rdma) {
 					    if (!need_swap)
 						    bcopy(buf + 24,
 							  &nretrans[1], 4);
@@ -7613,6 +8337,18 @@ acceptnewconn:
 							    *cp1++ = *cp2--;
 					    }
 				    }
+                                    else if(read_retrans && rdma)
+                                    {
+                                        if (!need_swap)
+                                            bcopy(rdma_buf[rdma_current_buf] + 24,
+                                                    &nretrans[1], 4);
+                                        else {
+                                            cp1 = (char *)&nretrans[1];
+                                            cp2 = rdma_buf[rdma_current_buf] + 27;
+                                            for ( i = 0; i < 4; i++ )
+                                                *cp1++ = *cp2--;
+                                        }
+                                    }
 				    stream_idx++;
 				    stream_idx = stream_idx % nstream;
 			    }
