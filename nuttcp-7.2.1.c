@@ -4888,6 +4888,16 @@ doit:
                         goto cleanup;
                     }
 
+                    if (rdma_listen(rdma_server_id, 6))
+                    {
+                        fputs("KO\n", stdout);
+                        mes("Error: listening for RDMA control connection");
+                        fputs("Error: listening for RDMA control connection\n", stdout);
+                        fputs("KO\n", stdout);
+                        goto cleanup;
+                    }
+
+
                     //fprintf(stderr,"Socket Bound\n");
                 }
 #endif
@@ -5310,15 +5320,6 @@ doit:
                             },
                             .qp_type = IBV_QPT_RC
                         };
-
-                        if (rdma_listen(rdma_server_id, 6))
-                        {
-                            fputs("KO\n", stdout);
-                            mes("Error: listening for RDMA control connection");
-                            fputs("Error: listening for RDMA control connection\n", stdout);
-                            fputs("KO\n", stdout);
-                            goto cleanup;
-                        }
 
                         if (rdma_get_cm_event(rdma_evch, &event)
                                 || event->event != RDMA_CM_EVENT_CONNECT_REQUEST)
