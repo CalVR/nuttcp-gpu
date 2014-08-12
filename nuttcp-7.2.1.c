@@ -489,9 +489,6 @@ static char RCSid[] = "@(#)$Revision: 1.2 $ (BRL)";
 #endif
 */
 
-// TODO: move to cmake build
-#define HAVE_RDMA 1
-
 #ifndef WANT_WUR
 #undef _FORTIFY_SOURCE
 #else
@@ -1285,6 +1282,7 @@ double owd_mini;		/* OWD minimum for interval report */
 double owd_maxi;		/* OWD maximum for interval report */
 double owd_avgi;		/* OWD average for interval report */
 
+#define NUM_RDMA_BUF 3
 #ifdef HAVE_RDMA
 struct rdma_event_channel *rdma_evch;
 struct rdma_cm_id *rdma_server_id;
@@ -1292,16 +1290,15 @@ struct rdma_cm_id *rdma_client_id;
 struct ibv_pd *rdma_pd;
 struct ibv_cq *rdma_cq;
 struct ibv_mr rdma_mr_remote;
-#define NUM_RDMA_BUF 3
 struct ibv_mr *rdma_mr[NUM_RDMA_BUF];
 struct ibv_recv_wr rdma_recv_wr[NUM_RDMA_BUF];
 struct ibv_send_wr rdma_send_wr[NUM_RDMA_BUF];
-int rdma_current_buf;
-char * rdma_buf[NUM_RDMA_BUF];
 struct ibv_mr *rdma_msg_mr;
 #endif
 
 int rdma = 0;
+char * rdma_buf[NUM_RDMA_BUF];
+int rdma_current_buf;
 
 void
 close_data_channels()
@@ -7671,7 +7668,7 @@ acceptnewconn:
                                 }
                                 else if(rdma)
                                 {
-
+#ifdef HAVE_RDMA
                                     //fprintf(stdout,"RDMA loop nbuf: %d, cnt: %d, intr: %d, nbytes: %d\n",nbuf,cnt,intr,nbytes);
                                     if(!nbuf--)
                                     {
@@ -7722,6 +7719,7 @@ acceptnewconn:
                                     }
 
                                     cnt = buflen;
+#endif
                                 }
 				if (clientserver && ((nbuf & 0x3FF) == 0)) {
                                     //fprintf(stdout,"In check\n");
@@ -8236,6 +8234,7 @@ acceptnewconn:
                                     }
                                     else
                                     {
+#ifdef HAVE_RDMA
                                         if(intr)
                                         {
                                             break;
@@ -8279,6 +8278,7 @@ acceptnewconn:
                                             break;
                                         }
                                         cnt = buflen;
+#endif
                                     }
 				    nbytes += cnt;
 				    cnt = 0;
