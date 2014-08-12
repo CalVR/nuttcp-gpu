@@ -1144,7 +1144,8 @@ Usage (transmitter): nuttcp [-t] [-options] [ctl_addr/]host [3rd-party] [<in]\n\
 	-a	retry failed server connection \"again\" for transient errors\n"
 #ifdef HAVE_RDMA
 "        -ee     enable RDMA\n\
-        -ep     set RDMA tcp control port\n"
+        -ep     set RDMA tcp control port\n\
+        -en     use event based cq notification\n"
 #endif
 #ifdef HAVE_SETPRIO
 "	-xP##	set nuttcp process priority (must be root)\n"
@@ -1289,6 +1290,7 @@ struct rdma_cm_id *rdma_server_id;
 struct rdma_cm_id *rdma_client_id;
 struct ibv_pd *rdma_pd;
 struct ibv_cq *rdma_cq;
+struct ibv_comp_channel *rdma_cq_channel;
 struct ibv_mr rdma_mr_remote;
 struct ibv_mr *rdma_mr[NUM_RDMA_BUF];
 struct ibv_recv_wr rdma_recv_wr[NUM_RDMA_BUF];
@@ -1297,6 +1299,7 @@ struct ibv_mr *rdma_msg_mr;
 #endif
 
 int rdma = 0;
+int rdma_event_notify = 0;
 char * rdma_buf[NUM_RDMA_BUF];
 int rdma_current_buf;
 
@@ -2442,6 +2445,10 @@ main( int argc, char **argv )
                         {
                             rdma = 1;
                         }
+                        else if(argv[0][2] == 'n')
+                        {
+                            rdma_event_notify = 1;
+                        }
                         break;
 #endif
 		case '-':
@@ -2583,7 +2590,7 @@ main( int argc, char **argv )
 		}
 	}
 
-        fprintf(stderr,"Host3:%d\n",host3);
+        //fprintf(stderr,"Host3:%d\n",host3);
 
 	if (multicast) {
 		udp = 1;
@@ -3375,8 +3382,8 @@ doit:
 		nretrans[stream_idx] = 0;
 	}
 
-        fprintf(stderr,"start_idx: %d, nstream: %d, nbuf: %d\n",start_idx,nstream,nbuf);
-        fprintf(stderr,"clientserver: %d, client: %d, trans: %d, reverse: %d, sinkmode: %d\n",clientserver,client,trans,reverse,sinkmode);
+        //fprintf(stderr,"start_idx: %d, nstream: %d, nbuf: %d\n",start_idx,nstream,nbuf);
+        //fprintf(stderr,"clientserver: %d, client: %d, trans: %d, reverse: %d, sinkmode: %d\n",clientserver,client,trans,reverse,sinkmode);
 	for ( stream_idx = start_idx; stream_idx <= nstream; stream_idx++ ) {
 		if (clientserver && (stream_idx == 1)) {
 			retransinfo = 0;
@@ -3879,7 +3886,7 @@ doit:
                                 {
                                     if(rdma)
                                     {
-                                        fprintf(stdout, "nuttcp%s%s: RDMA not supported by server version %d.%d.%d, need >= 7.2.1\n",
+                                        fprintf(stdout, "nuttcp%s%s: RDMA not supported by server version %d.%d.%d, need >= 7.3.1\n",
                                                         trans?"-t":"-r",
                                                         ident, rvers_major,
                                                         rvers_minor,
@@ -5017,7 +5024,23 @@ doit:
                             goto cleanup;
                         }
 
-                        if (!(rdma_cq = ibv_create_cq(rdma_client_id->verbs, 32, 0, 0, 0))) 
+                        if(rdma_event_notify)
+                        {
+                            if(!(rdma_cq_channel = ibv_create_comp_channel(rdma_client_id->verbs)))
+                            {
+                                fputs("KO\n", stdout);
+                                mes("Error: creating rdma cq channel");
+                                fputs("Error: creating rdma cq channel\n", stdout);
+                                fputs("KO\n", stdout);
+                                goto cleanup;
+                            }
+                        }
+                        else
+                        {
+                            rdma_cq_channel = NULL;
+                        }
+
+                        if (!(rdma_cq = ibv_create_cq(rdma_client_id->verbs, 32, 0, rdma_cq_channel, 0))) 
                         {
                             fputs("KO\n", stdout);
                             mes("Error: creating rdma cq");
@@ -5127,6 +5150,11 @@ doit:
                         }
 
                         rdma_ack_cm_event(event);
+
+                        if(rdma_event_notify)
+                        {
+                            ibv_req_notify_cq(rdma_cq,0);
+                        }
 
                         if(trans)
                         {
@@ -5339,7 +5367,23 @@ doit:
                             goto cleanup;
                         }
 
-                        if (!(rdma_cq = ibv_create_cq(rdma_client_id->verbs, 32, 0, 0, 0)))
+                        if(rdma_event_notify)
+                        {
+                            if(!(rdma_cq_channel = ibv_create_comp_channel(rdma_client_id->verbs)))
+                            {
+                                fputs("KO\n", stdout);
+                                mes("Error: creating rdma cq channel");
+                                fputs("Error: creating rdma cq channel\n", stdout);
+                                fputs("KO\n", stdout);
+                                goto cleanup;
+                            }
+                        }
+                        else
+                        {
+                            rdma_cq_channel = NULL;
+                        }
+
+                        if (!(rdma_cq = ibv_create_cq(rdma_client_id->verbs, 32, 0, rdma_cq_channel, 0)))
                         {
                             fputs("KO\n", stdout);
                             mes("Error: creating cq event");
@@ -5516,6 +5560,11 @@ doit:
                         }
 
                         rdma_ack_cm_event(event);
+
+                        if(rdma_event_notify)
+                        {
+                            ibv_req_notify_cq(rdma_cq,0);
+                        }
 
                         if(trans)
                         {
@@ -7527,6 +7576,7 @@ acceptnewconn:
 
 	if (sinkmode) {
 		register int cnt = 0;
+                //int rdma_cnt = 0;
 		if (trans) {
 			if (udp) {
 				strcpy(buf, "BOD0");
@@ -7701,7 +7751,36 @@ acceptnewconn:
                                     struct ibv_wc wc;
 
                                     // wait for finish
-                                    while (!ibv_poll_cq(rdma_cq, 1, &wc));
+                                    if(!rdma_event_notify)
+                                    {
+                                        while (!ibv_poll_cq(rdma_cq, 1, &wc));
+                                    }
+                                    else
+                                    {
+                                        struct ibv_cq *event_cq;
+                                        void * event_ctx;
+                                        if (ibv_get_cq_event(rdma_cq_channel, &event_cq, &event_ctx))
+                                        {
+                                            fputs("KO\n", stdout);
+                                            mes("Error: ibv_get_cq_event trans");
+                                            fputs("Error: ibv_get_cq_event trans\n", stdout);
+                                            fputs("KO\n", stdout);
+                                            goto cleanup;
+                                        }
+                                        ibv_ack_cq_events(rdma_cq,1);
+                                        while (!ibv_poll_cq(rdma_cq, 1, &wc));
+                                        if(ibv_req_notify_cq(rdma_cq,0))
+                                        {
+                                            fputs("KO\n", stdout);
+                                            mes("Error: ibv_req_notify_cq trans");
+                                            fputs("Error: ibv_req_notify_cq trans\n", stdout);
+                                            fputs("KO\n", stdout);
+                                            goto cleanup;
+                                        }
+                                    }
+
+                                    //rdma_cnt++;
+
                                     if(wc.status != IBV_WC_SUCCESS)
                                     {
                                         fputs("KO\n", stdout);
@@ -8243,7 +8322,36 @@ acceptnewconn:
                                         struct ibv_wc wc;
 
                                         // wait for recv
-                                        while (!ibv_poll_cq(rdma_cq, 1, &wc)) ;
+                                        if(!rdma_event_notify)
+                                        {
+                                            while (!ibv_poll_cq(rdma_cq, 1, &wc));
+                                        }
+                                        else
+                                        {
+                                            struct ibv_cq *event_cq;
+                                            void * event_ctx;
+                                            if (ibv_get_cq_event(rdma_cq_channel, &event_cq, &event_ctx))
+                                            {
+                                                fputs("KO\n", stdout);
+                                                mes("Error: ibv_get_cq_event !trans");
+                                                fputs("Error: ibv_get_cq_event !trans\n", stdout);
+                                                fputs("KO\n", stdout);
+                                                goto cleanup;
+                                            }
+                                            ibv_ack_cq_events(rdma_cq,1);
+                                            while (!ibv_poll_cq(rdma_cq, 1, &wc));
+                                            if(ibv_req_notify_cq(rdma_cq,0))
+                                            {
+                                                fputs("KO\n", stdout);
+                                                mes("Error: ibv_req_notify_cq !trans");
+                                                fputs("Error: ibv_req_notify_cq !trans\n", stdout);
+                                                fputs("KO\n", stdout);
+                                                goto cleanup;
+                                            }
+                                        }
+
+                                        //rdma_cnt++;
+
                                         if (wc.status != IBV_WC_SUCCESS) 
                                         {
                                             fputs("KO\n", stdout);
@@ -8353,10 +8461,11 @@ acceptnewconn:
 				    stream_idx++;
 				    stream_idx = stream_idx % nstream;
 			    }
-			    if (intr && (cnt > 0))
+			    if ((intr && (cnt > 0)) || (rdma && (cnt > 0)))
 				    nbytes += cnt;
 			}
 		}
+                //fprintf(stdout,"RDMA send/recv count: %d\n",rdma_cnt);
 	} else {
 		register int cnt;
 		if (trans) {
