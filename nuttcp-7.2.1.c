@@ -7681,6 +7681,11 @@ acceptnewconn:
                                     int sendIndex = rdma_current_buf;
                                     rdma_current_buf = (rdma_current_buf + 1) % NUM_RDMA_BUF;
 
+                                    if(intr)
+                                    {
+                                        rdma_done_sig = 1;
+                                    }
+
                                     // send trans intr status so recv not stuck waiting
                                     bcopy(&rdma_done_sig,rdma_buf[sendIndex] + 128,sizeof(int));
 
@@ -7712,16 +7717,11 @@ acceptnewconn:
 
                                     if(rdma_done_sig)
                                     {
-                                        cnt = 0;
+                                        cnt = buflen;
                                         break;
                                     }
 
                                     cnt = buflen;
-
-                                    if(intr && !rdma_done_sig)
-                                    {
-                                        rdma_done_sig = 1;
-                                    }
                                 }
 				if (clientserver && ((nbuf & 0x3FF) == 0)) {
                                     //fprintf(stdout,"In check\n");
@@ -8275,7 +8275,7 @@ acceptnewconn:
                                             //fprintf(stdout,"nuttcp-r: got sender done val: %d\n",val);
                                             // transmitter done
                                             //nbytes += buflen;
-                                            cnt = 0;
+                                            cnt = buflen;
                                             break;
                                         }
                                         cnt = buflen;
