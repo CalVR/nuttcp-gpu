@@ -8600,6 +8600,78 @@ acceptnewconn:
 			sretrans);
 	}
 
+        // wait for receiver to finish
+        if(rdma && trans)
+        {
+            struct ibv_recv_wr rcv_wr;
+            struct ibv_sge sge;
+
+            sge.addr = (uint64_t)rdma_buf[0];
+            sge.length = buflen;
+            sge.lkey = rdma_mr[0]->lkey;
+            rcv_wr.sg_list = &sge;
+            rcv_wr.num_sge = 1;
+            rcv_wr.next = NULL;
+
+            if (ibv_post_recv(rdma_client_id->qp, &rcv_wr, NULL))
+            {
+                fputs("KO\n", stdout);
+                mes("Error: rdma trans post final recv");
+                fputs("Error: rdma trans post final recv\n", stdout);
+                fputs("KO\n", stdout);
+                goto cleanup;
+            }
+
+            struct ibv_wc wc;
+            while (!ibv_poll_cq(rdma_cq, 1, &wc));
+
+            if(wc.status != IBV_WC_SUCCESS)
+            {
+                fputs("KO\n", stdout);
+                mes("Error: rdma trans recv wc");
+                fputs("Error: rdma trans recv wc\n", stdout);
+                fprintf(stdout,"Did not get success. Got: %d\n",wc.status);
+                fputs("KO\n", stdout);
+                goto cleanup;
+            }
+        }
+        else if(rdma)
+        {
+            struct ibv_send_wr snd_wr;
+            struct ibv_sge sge;
+
+            sge.addr = (uint64_t)rdma_buf[0];
+            sge.length = 1;
+            sge.lkey = rdma_mr[0]->lkey;
+            snd_wr.sg_list = &sge;
+            snd_wr.num_sge = 1;
+            snd_wr.opcode = IBV_WR_SEND;
+            snd_wr.send_flags = IBV_SEND_SIGNALED;
+            snd_wr.next = NULL;
+
+            if (ibv_post_send(rdma_client_id->qp, &snd_wr, NULL))
+            {
+                fputs("KO\n", stdout);
+                mes("Error: rdma !trans post final send");
+                fputs("Error: rdma !trans post final send\n", stdout);
+                fputs("KO\n", stdout);
+                goto cleanup;
+            }
+
+            struct ibv_wc wc;
+            while (!ibv_poll_cq(rdma_cq, 1, &wc));
+
+            if(wc.status != IBV_WC_SUCCESS)
+            {
+                fputs("KO\n", stdout);
+                mes("Error: rdma !trans send wc");
+                fputs("Error: rdma !trans send wc\n", stdout);
+                fprintf(stdout,"Did not get success. Got: %d\n",wc.status);
+                fputs("KO\n", stdout);
+                goto cleanup;
+            }
+        }
+
 #ifdef DEBUG
 	if (clientserver && client && !trans && do_jitter && njitter &&
 	    (format & DEBUGJITTER)) {
