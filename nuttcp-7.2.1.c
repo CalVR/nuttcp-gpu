@@ -8600,6 +8600,7 @@ acceptnewconn:
 			sretrans);
 	}
 
+#ifdef HAVE_RDMA
         // wait for receiver to finish
         if(rdma && trans)
         {
@@ -8671,6 +8672,7 @@ acceptnewconn:
                 goto cleanup;
             }
         }
+#endif
 
 #ifdef DEBUG
 	if (clientserver && client && !trans && do_jitter && njitter &&
